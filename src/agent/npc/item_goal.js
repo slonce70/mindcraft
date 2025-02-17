@@ -169,6 +169,7 @@ class ItemNode {
         if (final_quantity <= init_quantity) {
             this.fails += 1;
         }
+        return final_quantity > init_quantity;
     }
 }
 
@@ -298,46 +299,247 @@ export class ItemGoal {
     }
 
     async planResourceGathering(item_name, item_quantity=1) {
-        const plan = {
-            steps: [],
-            totalDistance: 0,
-            estimatedTime: 0
-        };
-
-        const requirements = this._gatherRequirements(item_name, item_quantity);
-        
-        const inventory = world.getInventoryCounts(this.agent.bot);
-        
-        const needed = requirements.filter(req => {
-            const inInventory = inventory[req.name] || 0;
-            return inInventory < req.quantity;
-        });
-
-        const resourceLocations = await this._findResourceLocations(needed);
-
-        const optimizedRoute = this._optimizeGatheringRoute(resourceLocations);
-        
-        for (const location of optimizedRoute) {
-            const toolRequired = mc.getBlockTool(location.resource.source || location.resource.name);
-            if (toolRequired && !inventory[toolRequired]) {
-                plan.steps.push({
-                    type: 'craft',
-                    item: toolRequired,
-                    quantity: 1,
-                    priority: 'high'
-                });
-            }
-            
-            plan.steps.push({
-                type: location.resource.type,
-                item: location.resource.name,
-                quantity: location.resource.quantity,
-                position: location.position,
-                priority: toolRequired ? 'normal' : 'high'
-            });
+        // First check if we already have the item in known locations
+        const knownLocations = this._getKnownLocations(item_name);
+        if (knownLocations.length > 0) {
+            this._currentPlan = {
+                type: 'known_location',
+                locations: this._optimizeGatheringRoute(knownLocations),
+                requirements: new Map(),
+                tools: this._getRequiredTools(item_name)
+            };
+            return true;
         }
 
-        return plan;
+        // If not found in known locations, plan gathering from scratch
+        const requirements = this._gatherRequirements(item_name, item_quantity);
+        if (requirements.size === 0) return false;
+
+        const locations = this._findResourceLocations(requirements);
+        if (locations.length === 0) return false;
+
+        this._currentPlan = {
+            type: 'gather_new',
+            locations: this._optimizeGatheringRoute(locations),
+            requirements,
+            tools: this._getRequiredTools(item_name)
+        };
+        return true;
+    }
+
+    _getKnownLocations(item_name) {
+        const locations = [];
+        const memory = this.agent.memory_bank.getJson();
+        
+        // Parse memory entries for relevant locations
+        for (const [key, value] of Object.entries(memory)) {
+            const keyLower = key.toLowerCase();
+            const itemLower = item_name.toLowerCase();
+            
+            // Check if memory entry contains item name
+            if (keyLower.includes(itemLower)) {
+                if (Array.isArray(value) && value.length === 3) {
+                    locations.push({
+                        x: value[0],
+                        y: value[1],
+                        z: value[2],
+                        type: item_name,
+                        source: 'memory'
+                    });
+                }
+            }
+        }
+        
+        return locations;
+    }
+
+    _getRequiredTools(item_name) {
+        const tools = new Set();
+        const mcData = require('minecraft-data')(this.agent.bot.version);
+        
+        // Check if item requires specific tool
+        if (item_name.includes('diamond')) {
+            tools.add('iron_pickaxe');
+        } else if (item_name.includes('iron')) {
+            tools.add('stone_pickaxe');
+        }
+        
+        // Add any additional tool requirements based on block type
+        const block = mcData.blocksByName[item_name];
+        if (block) {
+            const tool = this.agent.bot.pathfinder.getToolFor(block);
+            if (tool) tools.add(tool.name);
+        }
+        
+        return Array.from(tools);
+    }
+
+    async executeNext(item_name, item_quantity=1) {
+        const bot = this.agent.bot;
+        if (!bot) return false;
+
+        // Check if we already have the item
+        const itemCount = bot.inventory.count(item_name);
+        if (itemCount >= item_quantity) {
+            return true;
+        }
+
+        // Get required tools first
+        const requiredTools = await this._getRequiredTools(item_name);
+        for (const tool of requiredTools) {
+            if (!bot.inventory.findInventoryItem(tool)) {
+                console.log(`Need ${tool} to collect ${item_name}`);
+                await this.executeNext(tool, 1);
+            }
+        }
+
+        // Try to craft the item if it's craftable
+        const recipe = bot.recipesFor(item_name)[0];
+        if (recipe) {
+            // Get all ingredients
+            for (const ingredient of recipe.ingredients) {
+                const needed = ingredient.count;
+                const have = bot.inventory.count(ingredient.name);
+                if (have < needed) {
+                    await this.executeNext(ingredient.name, needed - have);
+                }
+            }
+            // Try crafting
+            try {
+                await bot.craft(recipe, 1);
+                return true;
+            } catch (err) {
+                console.log(`Failed to craft ${item_name}:`, err.message);
+            }
+        }
+
+        // If we can't craft or crafting failed, try to collect from world
+        return await this._collectResource(item_name, item_quantity);
+    }
+
+    async _collectResource(itemName, quantity) {
+        const bot = this.agent.bot;
+        let collected = 0;
+        const startY = Math.floor(bot.entity.position.y);
+
+        // Try different Y levels if needed (for ores)
+        const yLevels = this._getOptimalYLevels(itemName);
+        
+        for (const targetY of yLevels) {
+            // Move to target Y level if needed
+            if (Math.abs(bot.entity.position.y - targetY) > 3) {
+                await this._mineToLevel(targetY);
+            }
+
+            // Search in expanding radius
+            for (let radius = 16; radius <= 64; radius += 16) {
+                if (collected >= quantity) break;
+
+                const blocks = bot.findBlocks({
+                    matching: itemName,
+                    maxDistance: radius,
+                    count: 64
+                });
+
+                if (blocks.length > 0) {
+                    for (const pos of blocks) {
+                        if (collected >= quantity) break;
+                        
+                        const block = bot.blockAt(pos);
+                        if (!block) continue;
+
+                        try {
+                            await bot.pathfinder.goto(pos);
+                            await bot.dig(block);
+                            collected++;
+                            
+                            // Wait for drops to be collected
+                            await new Promise(resolve => setTimeout(resolve, 250));
+                        } catch (err) {
+                            console.log(`Failed to collect ${itemName}:`, err.message);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        return collected > 0;
+    }
+
+    _getOptimalYLevels(itemName) {
+        // Default to current Y level
+        const currentY = Math.floor(this.agent.bot.entity.position.y);
+        
+        // Optimal Y levels for different resources
+        const yLevelMap = {
+            'diamond_ore': [11],
+            'iron_ore': [16],
+            'coal_ore': [95],
+            'gold_ore': [32],
+            'redstone_ore': [13],
+            'lapis_ore': [13],
+            'copper_ore': [48],
+            'emerald_ore': [32]
+        };
+
+        // For ores, use optimal levels
+        if (itemName.endsWith('_ore')) {
+            return yLevelMap[itemName] || [currentY];
+        }
+
+        // For trees and surface resources, stay near surface
+        if (['oak_log', 'birch_log', 'spruce_log', 'jungle_log', 'acacia_log', 'dark_oak_log'].includes(itemName)) {
+            return [64]; // Surface level
+        }
+
+        // Default to current level
+        return [currentY];
+    }
+
+    async _mineToLevel(targetY) {
+        const bot = this.agent.bot;
+        const pos = bot.entity.position;
+        if (Math.floor(pos.y) === targetY) return;
+
+        // Dig down or climb up safely
+        const direction = pos.y > targetY ? 'down' : 'up';
+        while (Math.floor(bot.entity.position.y) !== targetY) {
+            try {
+                const currentBlock = direction === 'down' 
+                    ? bot.blockAt(pos.offset(0, -1, 0))
+                    : bot.blockAt(pos.offset(0, 2, 0));
+                
+                if (!currentBlock || currentBlock.name === 'air') {
+                    if (direction === 'up') {
+                        // Place blocks to climb up
+                        await this._placeBlock();
+                    }
+                } else {
+                    // Check for hazards
+                    const aboveBlock = bot.blockAt(pos.offset(0, 2, 0));
+                    if (aboveBlock && (aboveBlock.name === 'water' || aboveBlock.name === 'lava')) {
+                        console.log('Detected hazard, finding alternative path');
+                        break;
+                    }
+                    
+                    // Dig the block
+                    await bot.dig(currentBlock);
+                }
+                
+                // Move safely
+                if (direction === 'down') {
+                    bot.setControlState('sneak', true);
+                } else {
+                    bot.setControlState('jump', true);
+                }
+                await new Promise(resolve => setTimeout(resolve, 250));
+                bot.clearControlStates();
+            } catch (err) {
+                console.log('Error while mining to level:', err.message);
+                break;
+            }
+        }
     }
 
     _gatherRequirements(item_name, quantity, memo = new Map()) {
@@ -425,51 +627,6 @@ export class ItemGoal {
             Math.pow(pos2.y - pos1.y, 2) +
             Math.pow(pos2.z - pos1.z, 2)
         );
-    }
-
-    async executeNext(item_name, item_quantity=1) {
-        if (!this._currentPlan || this._currentPlan.targetItem !== item_name) {
-            this._currentPlan = await this.planResourceGathering(item_name, item_quantity);
-            this._currentPlan.targetItem = item_name;
-            this._currentPlan.currentStep = 0;
-        }
-
-        if (this._currentPlan && this._currentPlan.steps.length > this._currentPlan.currentStep) {
-            const step = this._currentPlan.steps[this._currentPlan.currentStep];
-            this._currentPlan.currentStep++;
-            
-            if (this.nodes[step.item] === undefined) {
-                this.nodes[step.item] = new ItemWrapper(this, null, step.item);
-            }
-            this.goal = this.nodes[step.item];
-            
-            let next_info = this.goal.getNext(step.quantity);
-            if (!next_info) {
-                console.log(`Invalid item goal ${this.goal.name}`);
-                return false;
-            }
-            
-            if (step.position) {
-                await this.agent.actions.runAction('itemGoal:collect', async () => {
-                    await skills.collectBlock(this.agent.bot, step.item, step.quantity, [], step.position);
-                });
-            } else {
-                return await this._executeNode(next_info.node, next_info.quantity);
-            }
-        }
-        
-        if (!this.nodes[item_name]) {
-            this.nodes[item_name] = new ItemWrapper(this, null, item_name);
-        }
-        this.goal = this.nodes[item_name];
-        
-        let next_info = this.goal.getNext(item_quantity);
-        if (!next_info) {
-            console.log(`Invalid item goal ${this.goal.name}`);
-            return false;
-        }
-        
-        return await this._executeNode(next_info.node, next_info.quantity);
     }
 
     async _executeNode(node, quantity) {

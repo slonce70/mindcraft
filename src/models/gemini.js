@@ -33,7 +33,7 @@ export class Gemini {
         this.genAI = new GoogleGenerativeAI(getKey('GEMINI_API_KEY'));
     }
 
-    async sendRequest(turns, systemMessage) {
+    async sendRequest(turns, systemMessage, stop_seq='***') {
         let model;
         const modelConfig = {
             model: this.model_name || "gemini-1.5-flash",
@@ -53,29 +53,49 @@ export class Gemini {
             );
         }
 
-        console.log('Awaiting Google API response...');
+        const maxRetries = 3;
+        const retryDelay = 2000; // 2 seconds
+        
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                console.log('Awaiting Google API response...');
 
-        turns.unshift({ role: 'system', content: systemMessage });
-        turns = strictFormat(turns);
-        let contents = [];
-        for (let turn of turns) {
-            contents.push({
-                role: turn.role === 'assistant' ? 'model' : 'user',
-                parts: [{ text: turn.content }]
-            });
-        }
+                turns.unshift({ role: 'system', content: systemMessage });
+                turns = strictFormat(turns);
+                let contents = [];
+                for (let turn of turns) {
+                    contents.push({
+                        role: turn.role === 'assistant' ? 'model' : 'user',
+                        parts: [{ text: turn.content }]
+                    });
+                }
 
-        const result = await model.generateContent({
-            contents,
-            generationConfig: {
-                ...(this.params || {})
+                const result = await model.generateContent({
+                    contents,
+                    generationConfig: {
+                        ...(this.params || {})
+                    }
+                });
+                const response = await result.response;
+                const text = response.text();
+                console.log('Received.');
+
+                return text;
+            } catch (error) {
+                console.log(`API request attempt ${attempt} failed:`, error.message);
+                
+                if (error.message.includes('429') || error.message.includes('quota')) {
+                    if (attempt < maxRetries) {
+                        console.log(`Waiting ${retryDelay}ms before retry...`);
+                        await new Promise(resolve => setTimeout(resolve, retryDelay * attempt));
+                        continue;
+                    }
+                }
+                
+                // For other errors or if we've exhausted retries
+                throw new Error(`Failed after ${attempt} attempts: ${error.message}`);
             }
-        });
-        const response = await result.response;
-        const text = response.text();
-        console.log('Received.');
-
-        return text;
+        }
     }
 
     async embed(text) {

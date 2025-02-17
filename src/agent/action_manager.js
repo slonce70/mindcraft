@@ -26,20 +26,39 @@ export class ActionManager {
         
         let stopAttemptStart = Date.now();
         const TIMEOUT_MS = 10000; // 10 seconds timeout
+        const MAX_UNSTUCK_ATTEMPTS = 3;
+        let unstuckAttempts = 0;
         
         const timeoutPromise = new Promise((resolve) => {
             setTimeout(() => {
-                this.executing = false; // Force stop execution
-                this.agent.cleanKill('Code execution refused stop after 10 seconds. Forcing stop.');
-                resolve();
+                if (this.executing) {
+                    console.log('Action timeout reached. Attempting to unstuck...');
+                    this._attemptUnstuck().then(() => {
+                        this.executing = false;
+                        resolve();
+                    });
+                }
             }, TIMEOUT_MS);
         });
 
         const stopAttemptPromise = (async () => {
             while (this.executing && (Date.now() - stopAttemptStart) < TIMEOUT_MS) {
-                this.agent.requestInterrupt();
-                console.log('waiting for code to finish executing...');
-                await new Promise(resolve => setTimeout(resolve, 300));
+                if (unstuckAttempts < MAX_UNSTUCK_ATTEMPTS) {
+                    this.agent.requestInterrupt();
+                    console.log('waiting for code to finish executing...');
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                    
+                    // If still stuck after waiting, try to unstuck
+                    if (this.executing && (Date.now() - stopAttemptStart) > 2000) {
+                        console.log(`Unstuck attempt ${unstuckAttempts + 1}/${MAX_UNSTUCK_ATTEMPTS}`);
+                        await this._attemptUnstuck();
+                        unstuckAttempts++;
+                    }
+                } else {
+                    console.log('Max unstuck attempts reached. Forcing stop.');
+                    this.executing = false;
+                    break;
+                }
             }
         })();
 
@@ -168,4 +187,57 @@ export class ActionManager {
         }, TIMEOUT_MINS * 60 * 1000);
     }
 
+    async _attemptUnstuck() {
+        try {
+            const bot = this.agent.bot;
+            if (!bot) return;
+
+            // First try using the existing moveAway function
+            try {
+                const skills = require('./library/skills');
+                await skills.moveAway(bot, 2);
+                if (!this.executing) return; // Successfully moved away
+            } catch (moveError) {
+                console.log('moveAway failed, trying basic movement patterns:', moveError);
+                
+                // Fall back to basic movement patterns if moveAway fails
+                const movements = [
+                    async () => {
+                        bot.setControlState('forward', true);
+                        bot.setControlState('jump', true);
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                        bot.setControlState('forward', false);
+                        bot.setControlState('jump', false);
+                    },
+                    async () => {
+                        bot.setControlState('back', true);
+                        await new Promise(resolve => setTimeout(resolve, 500));
+                        bot.setControlState('back', false);
+                    },
+                    async () => {
+                        bot.setControlState('left', true);
+                        await new Promise(resolve => setTimeout(resolve, 300));
+                        bot.setControlState('left', false);
+                    },
+                    async () => {
+                        bot.setControlState('right', true);
+                        await new Promise(resolve => setTimeout(resolve, 300));
+                        bot.setControlState('right', false);
+                    }
+                ];
+
+                // Try each movement pattern
+                for (const movement of movements) {
+                    if (!this.executing) break; // Stop if action was cancelled
+                    await movement();
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                }
+            }
+
+            // Clear all control states
+            bot.clearControlStates();
+        } catch (error) {
+            console.error('Error in unstuck attempt:', error);
+        }
+    }
 }
