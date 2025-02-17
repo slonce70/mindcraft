@@ -3,7 +3,6 @@ import * as world from '../library/world.js';
 import * as mc from '../../utils/mcdata.js';
 import { itemSatisfied } from './utils.js';
 
-
 const blacklist = [
     'coal_block',
     'iron_block',
@@ -18,7 +17,6 @@ const blacklist = [
     'warped',
     'dye'
 ]
-
 
 class ItemNode {
     constructor(manager, wrapper, name) {
@@ -174,7 +172,6 @@ class ItemNode {
     }
 }
 
-
 class ItemWrapper {
     constructor(manager, parent, name) {
         this.manager = manager;
@@ -291,64 +288,215 @@ class ItemWrapper {
     }
 }
 
-
 export class ItemGoal {
     constructor(agent) {
         this.agent = agent;
         this.goal = null;
         this.nodes = {};
         this.failed = [];
+        this._currentPlan = null;
+    }
+
+    async planResourceGathering(item_name, item_quantity=1) {
+        const plan = {
+            steps: [],
+            totalDistance: 0,
+            estimatedTime: 0
+        };
+
+        const requirements = this._gatherRequirements(item_name, item_quantity);
+        
+        const inventory = world.getInventoryCounts(this.agent.bot);
+        
+        const needed = requirements.filter(req => {
+            const inInventory = inventory[req.name] || 0;
+            return inInventory < req.quantity;
+        });
+
+        const resourceLocations = await this._findResourceLocations(needed);
+
+        const optimizedRoute = this._optimizeGatheringRoute(resourceLocations);
+        
+        for (const location of optimizedRoute) {
+            const toolRequired = mc.getBlockTool(location.resource.source || location.resource.name);
+            if (toolRequired && !inventory[toolRequired]) {
+                plan.steps.push({
+                    type: 'craft',
+                    item: toolRequired,
+                    quantity: 1,
+                    priority: 'high'
+                });
+            }
+            
+            plan.steps.push({
+                type: location.resource.type,
+                item: location.resource.name,
+                quantity: location.resource.quantity,
+                position: location.position,
+                priority: toolRequired ? 'normal' : 'high'
+            });
+        }
+
+        return plan;
+    }
+
+    _gatherRequirements(item_name, quantity, memo = new Map()) {
+        if (memo.has(item_name)) {
+            const existing = memo.get(item_name);
+            existing.quantity += quantity;
+            return [];
+        }
+
+        const requirements = [{
+            name: item_name,
+            quantity: quantity
+        }];
+        memo.set(item_name, requirements[0]);
+
+        const node = this.nodes[item_name];
+        if (!node) return requirements;
+
+        if (node.prereq) {
+            requirements.push(...this._gatherRequirements(node.prereq.name, 1, memo));
+        }
+
+        if (node.recipe) {
+            for (const ingredient of node.recipe) {
+                requirements.push(...this._gatherRequirements(ingredient.node.name, ingredient.quantity, memo));
+            }
+        }
+
+        return requirements;
+    }
+
+    async _findResourceLocations(resources) {
+        const locations = [];
+        for (const resource of resources) {
+            if (this.nodes[resource.name]) {
+                const node = this.nodes[resource.name];
+                if (node.type === 'block') {
+                    const nearestBlocks = world.getNearestBlocks(this.agent.bot, node.source || node.name, 64, 5);
+                    for (const block of nearestBlocks) {
+                        locations.push({
+                            resource: {
+                                ...resource,
+                                type: node.type,
+                                source: node.source
+                            },
+                            position: block.position
+                        });
+                    }
+                }
+            }
+        }
+        return locations;
+    }
+
+    _optimizeGatheringRoute(locations) {
+        if (!locations.length) return [];
+        
+        const optimized = [locations[0]];
+        const remaining = locations.slice(1);
+        const botPos = this.agent.bot.entity.position;
+        
+        while (remaining.length) {
+            const lastPos = optimized[optimized.length - 1].position;
+            let nearestIdx = 0;
+            let nearestDist = Infinity;
+            
+            for (let i = 0; i < remaining.length; i++) {
+                const dist = this._distance(lastPos, remaining[i].position);
+                if (dist < nearestDist) {
+                    nearestDist = dist;
+                    nearestIdx = i;
+                }
+            }
+            
+            optimized.push(remaining[nearestIdx]);
+            remaining.splice(nearestIdx, 1);
+        }
+        
+        return optimized;
+    }
+
+    _distance(pos1, pos2) {
+        return Math.sqrt(
+            Math.pow(pos2.x - pos1.x, 2) +
+            Math.pow(pos2.y - pos1.y, 2) +
+            Math.pow(pos2.z - pos1.z, 2)
+        );
     }
 
     async executeNext(item_name, item_quantity=1) {
-        if (this.nodes[item_name] === undefined)
-            this.nodes[item_name] = new ItemWrapper(this, null, item_name);
-        this.goal = this.nodes[item_name];
+        if (!this._currentPlan || this._currentPlan.targetItem !== item_name) {
+            this._currentPlan = await this.planResourceGathering(item_name, item_quantity);
+            this._currentPlan.targetItem = item_name;
+            this._currentPlan.currentStep = 0;
+        }
 
-        // Get next goal to execute
+        if (this._currentPlan && this._currentPlan.steps.length > this._currentPlan.currentStep) {
+            const step = this._currentPlan.steps[this._currentPlan.currentStep];
+            this._currentPlan.currentStep++;
+            
+            if (this.nodes[step.item] === undefined) {
+                this.nodes[step.item] = new ItemWrapper(this, null, step.item);
+            }
+            this.goal = this.nodes[step.item];
+            
+            let next_info = this.goal.getNext(step.quantity);
+            if (!next_info) {
+                console.log(`Invalid item goal ${this.goal.name}`);
+                return false;
+            }
+            
+            if (step.position) {
+                await this.agent.actions.runAction('itemGoal:collect', async () => {
+                    await skills.collectBlock(this.agent.bot, step.item, step.quantity, [], step.position);
+                });
+            } else {
+                return await this._executeNode(next_info.node, next_info.quantity);
+            }
+        }
+        
+        if (!this.nodes[item_name]) {
+            this.nodes[item_name] = new ItemWrapper(this, null, item_name);
+        }
+        this.goal = this.nodes[item_name];
+        
         let next_info = this.goal.getNext(item_quantity);
         if (!next_info) {
             console.log(`Invalid item goal ${this.goal.name}`);
             return false;
         }
-        let next = next_info.node;
-        let quantity = next_info.quantity;
+        
+        return await this._executeNode(next_info.node, next_info.quantity);
+    }
 
-        // Prevent unnecessary attempts to obtain blocks that are not nearby
-        if (next.type === 'block' && !world.getNearbyBlockTypes(this.agent.bot).includes(next.source) ||
-                next.type === 'hunt' && !world.getNearbyEntityTypes(this.agent.bot).includes(next.source)) {
-            next.fails += 1;
-
-            // If the bot has failed to obtain the block before, explore
-            if (this.failed.includes(next.name)) {
-                this.failed = this.failed.filter((item) => item !== next.name);
-                await this.agent.actions.runAction('itemGoal:explore', async () => {
-                    await skills.moveAway(this.agent.bot, 8);
-                });
-            } else {
-                this.failed.push(next.name);
-                await new Promise((resolve) => setTimeout(resolve, 500));
-                this.agent.bot.emit('idle');
-            }
-            return false;
+    async _executeNode(node, quantity) {
+        if (!node.isReady()) {
+            node.fails += 1;
+            return;
         }
-
-        // Wait for the bot to be idle before attempting to execute the next goal
-        if (!this.agent.isIdle())
-            return false;
-
-        // Execute the next goal
-        let init_quantity = world.getInventoryCounts(this.agent.bot)[next.name] || 0;
-        await this.agent.actions.runAction('itemGoal:next', async () => {
-            await next.execute(quantity);
-        });
-        let final_quantity = world.getInventoryCounts(this.agent.bot)[next.name] || 0;
-
-        // Log the result of the goal attempt
-        if (final_quantity > init_quantity) {
-            console.log(`Successfully obtained ${next.name} for goal ${this.goal.name}`);
-        } else {
-            console.log(`Failed to obtain ${next.name} for goal ${this.goal.name}`);
+        let inventory = world.getInventoryCounts(this.agent.bot);
+        let init_quantity = inventory[node.name] || 0;
+        if (node.type === 'block') {
+            await skills.collectBlock(this.agent.bot, node.source, quantity, this.agent.npc.getBuiltPositions());
+        } else if (node.type === 'smelt') {
+            let to_smelt_name = node.recipe[0].node.name;
+            let to_smelt_quantity = Math.min(quantity, inventory[to_smelt_name] || 1);
+            await skills.smeltItem(this.agent.bot, to_smelt_name, to_smelt_quantity);
+        } else if (node.type === 'hunt') {
+            for (let i=0; i<quantity; i++) {
+                res = await skills.attackNearest(this.agent.bot, node.source);
+                if (!res || this.agent.bot.interrupt_code)
+                    break;
+            }
+        } else if (node.type === 'craft') {
+            await skills.craftRecipe(this.agent.bot, node.name, quantity);
+        }
+        let final_quantity = world.getInventoryCounts(this.agent.bot)[node.name] || 0;
+        if (final_quantity <= init_quantity) {
+            node.fails += 1;
         }
         return final_quantity > init_quantity;
     }

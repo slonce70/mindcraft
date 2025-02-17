@@ -23,15 +23,31 @@ export class ActionManager {
 
     async stop() {
         if (!this.executing) return;
-        const timeout = setTimeout(() => {
-            this.agent.cleanKill('Code execution refused stop after 10 seconds. Killing process.');
-        }, 10000);
-        while (this.executing) {
-            this.agent.requestInterrupt();
-            console.log('waiting for code to finish executing...');
-            await new Promise(resolve => setTimeout(resolve, 300));
-        }
-        clearTimeout(timeout);
+        
+        let stopAttemptStart = Date.now();
+        const TIMEOUT_MS = 10000; // 10 seconds timeout
+        
+        const timeoutPromise = new Promise((resolve) => {
+            setTimeout(() => {
+                this.executing = false; // Force stop execution
+                this.agent.cleanKill('Code execution refused stop after 10 seconds. Forcing stop.');
+                resolve();
+            }, TIMEOUT_MS);
+        });
+
+        const stopAttemptPromise = (async () => {
+            while (this.executing && (Date.now() - stopAttemptStart) < TIMEOUT_MS) {
+                this.agent.requestInterrupt();
+                console.log('waiting for code to finish executing...');
+                await new Promise(resolve => setTimeout(resolve, 300));
+            }
+        })();
+
+        // Wait for either normal stop or timeout
+        await Promise.race([stopAttemptPromise, timeoutPromise]);
+        
+        this.currentActionLabel = '';
+        this.currentActionFn = null;
     } 
 
     cancelResume() {
